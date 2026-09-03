@@ -1212,6 +1212,11 @@ static QUEUE_INFO g_stub_queue_out;
 static int g_stub_fd = -1;
 static pid_t g_stub_pid = 0;
 static std::string g_stub_write_remainder;
+
+// Milliseconds spent in script_pipepump making no progress (#2238).  The
+// twin of GanlAdapter's counter -- both pumps had the same unbounded
+// poll(fd, -1), and a synchronous COM call parks the whole process in it.
+static int64_t g_stub_stall_ms = 0;
 static mux_ISlaveControl *g_pISlaveControl = nullptr;
 
 static void reap_stubslave_bounded(pid_t pid)
@@ -1292,7 +1297,40 @@ extern "C" MUX_RESULT DCL_API script_pipepump(void)
     }
     pfd.revents = 0;
 
-    int found = poll(&pfd, 1, -1);
+    // #2238: bounded, like GanlAdapter::pump_stubslave.  An infinite poll
+    // here parks the entire process on a channel that may never answer.
+    //
+    static const int STUB_POLL_SLICE_MS = 1000;
+    static int64_t nStallLimitMs = -1;
+    if (nStallLimitMs < 0)
+    {
+        nStallLimitMs = 60000;
+        const char *pEnv = getenv("TINYMUX_STUB_STALL_MS");
+        if (nullptr != pEnv)
+        {
+            long v = strtol(pEnv, nullptr, 10);
+            if (0 < v)
+            {
+                nStallLimitMs = static_cast<int64_t>(v);
+            }
+        }
+    }
+
+    int found = poll(&pfd, 1, STUB_POLL_SLICE_MS);
+    if (0 == found)
+    {
+        g_stub_stall_ms += STUB_POLL_SLICE_MS;
+        if (nStallLimitMs <= g_stub_stall_ms)
+        {
+            fprintf(stderr,
+                "muxscript: stubslave channel stalled for %d seconds with no"
+                " progress; assuming a desynced pipe and stopping it.\n",
+                static_cast<int>(nStallLimitMs / 1000));
+            shutdown_stubslave_parent();
+            return MUX_E_FAIL;
+        }
+        return MUX_S_OK;
+    }
     if (found < 0)
     {
         if (EINTR == errno)
@@ -1323,6 +1361,7 @@ extern "C" MUX_RESULT DCL_API script_pipepump(void)
                 return MUX_E_FAIL;
             }
             Pipe_AppendBytes(&g_stub_queue_in, static_cast<size_t>(len), buf);
+            g_stub_stall_ms = 0;   // progress (#2238)
         }
     }
 
@@ -1352,6 +1391,7 @@ extern "C" MUX_RESULT DCL_API script_pipepump(void)
             if (len > 0)
             {
                 g_stub_write_remainder.erase(0, static_cast<size_t>(len));
+                g_stub_stall_ms = 0;   // progress (#2238)
                 continue;
             }
             if (len < 0)

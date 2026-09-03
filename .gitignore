@@ -239,6 +239,10 @@ tests/shacrypt/test_shacrypt
 tests/table/test_table
 tests/*/*.o
 
+# Scratch game directories built by the stubslave harnesses.
+tests/stubslave/work/
+tests/stubwedge/work/
+
 # macOS Finder metadata.  Never wanted, anywhere.
 .DS_Store
 

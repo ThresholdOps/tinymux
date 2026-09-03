@@ -4134,7 +4134,61 @@ MUX_RESULT GanlAdapter::pump_stubslave()
     }
     pfd.revents = 0;
 
-    int found = poll(&pfd, 1, -1);
+    // #2238: NEVER poll here without a deadline.  A synchronous stubslave COM
+    // call (do_dbck runs one every check_interval, default 600s) parks the
+    // entire server in this pump -- no network events, no timers, no dumps,
+    // no signal processing, not even @shutdown.  A single desynced frame once
+    // left a farm deployment wedged, silent and at zero CPU, for 22 days.
+    // Poll in slices so the wait is interruptible and can be given up on.
+    //
+    static const int STUB_POLL_SLICE_MS = 1000;
+
+    // 60s default: far longer than any healthy COM round-trip (do_dbck's
+    // ModuleMaintenance returns in milliseconds), short enough that a wedged
+    // channel costs a hiccup rather than the deployment.  TINYMUX_STUB_STALL_MS
+    // overrides it -- the regression test drives it down to a few seconds, and
+    // it doubles as an operator escape hatch on a genuinely slow module.
+    //
+    static int64_t nStallLimitMs = -1;
+    if (nStallLimitMs < 0)
+    {
+        nStallLimitMs = 60000;
+        const char *pEnv = getenv("TINYMUX_STUB_STALL_MS");
+        if (nullptr != pEnv)
+        {
+            long v = strtol(pEnv, nullptr, 10);
+            if (0 < v)
+            {
+                nStallLimitMs = static_cast<int64_t>(v);
+            }
+        }
+    }
+
+    int found = poll(&pfd, 1, STUB_POLL_SLICE_MS);
+
+    if (0 == found)
+    {
+        // Nothing happened in this slice.  Only a total absence of progress
+        // counts toward the limit; any byte moved below resets it.
+        //
+        stubslave_channel_->stallMs += STUB_POLL_SLICE_MS;
+        if (nStallLimitMs <= stubslave_channel_->stallMs)
+        {
+            STARTLOG(LOG_ALWAYS, "NET", "STUB");
+            g_pILog->log_text(T("Stubslave channel stalled for "));
+            g_pILog->log_number(static_cast<int>(nStallLimitMs / 1000));
+            g_pILog->log_text(T(" seconds with no progress (queued-out="));
+            g_pILog->log_number(static_cast<int>(Pipe_QueueLength(&Queue_Out)));
+            g_pILog->log_text(T(" remainder="));
+            g_pILog->log_number(static_cast<int>(stubslave_channel_->writeRemainder.size()));
+            g_pILog->log_text(T("). Assuming a desynced pipe; stopping the stubslave so the game continues without it."));
+            ENDLOG;
+
+            shutdown_stubslave();
+            return MUX_E_FAIL;
+        }
+        return MUX_S_OK;
+    }
 
     if (found < 0)
     {
@@ -4190,6 +4244,7 @@ MUX_RESULT GanlAdapter::pump_stubslave()
                 return MUX_E_FAIL;
             }
             Pipe_AppendBytes(&Queue_In, len, buf);
+            stubslave_channel_->stallMs = 0;   // progress (#2238)
         }
     }
 
@@ -4223,6 +4278,7 @@ MUX_RESULT GanlAdapter::pump_stubslave()
             if (len > 0)
             {
                 stubslave_channel_->writeRemainder.erase(0, static_cast<size_t>(len));
+                stubslave_channel_->stallMs = 0;   // progress (#2238)
                 continue;
             }
             if (len < 0)
