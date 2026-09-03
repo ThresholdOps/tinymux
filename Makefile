@@ -10,7 +10,7 @@
 
 # Keep test-lua-jit (added on master after this branch was cut) alongside
 # the new dual-route smoke targets.
-.PHONY: all install clean realclean test test-buildconfig test-db test-ios test-ganl test-netaddr test-nfc test-digest test-shacrypt test-libmux test-color-ops test-table test-slave test-stubslave-teardown test-hir test-format test-dbt test-alarm test-blob test-codiff test-codiff-2019 test-smoke test-smoke-ast test-smoke-builtin test-comsys-handoff test-comsys-mogrify test-comsys-conformance test-comsys-cmdparity test-scenario test-poison test-perf test-growth test-parity213 test-stress test-jit-qreg test-jit-ifelse test-jit-recursion test-lua-jit test-lua-ecall test-vacuous test-narrowing test-config test-nls test-nls-plural test-nls-runtime test-nls-ko test-asan hooks
+.PHONY: all install clean realclean test test-buildconfig test-db test-ios test-ganl test-netaddr test-nfc test-digest test-shacrypt test-libmux test-color-ops test-table test-slave test-stubslave-teardown test-stubwedge test-hir test-format test-dbt test-alarm test-blob test-codiff test-codiff-2019 test-smoke test-smoke-ast test-smoke-builtin test-comsys-handoff test-comsys-mogrify test-comsys-conformance test-comsys-cmdparity test-scenario test-poison test-perf test-growth test-parity213 test-stress test-jit-qreg test-jit-ifelse test-jit-recursion test-lua-jit test-lua-ecall test-vacuous test-narrowing test-config test-nls test-nls-plural test-nls-runtime test-nls-ko test-asan hooks
 
 # Install git hooks on first build so all developers get protection
 # against accidentally editing generated files.
@@ -49,7 +49,7 @@ realclean:
 TEST_TARGETS = \
     test-ganl test-netaddr test-digest test-shacrypt test-libmux test-color-ops test-table \
     test-db \
-    test-slave test-stubslave-teardown test-hir test-format test-nfc \
+    test-slave test-stubslave-teardown test-stubwedge test-hir test-format test-nfc \
     test-nls test-nls-plural test-nls-runtime test-nls-ko \
     test-vacuous test-narrowing test-config test-dbt test-alarm \
     test-blob test-codiff \
@@ -478,6 +478,13 @@ test-slave: install
 test-stubslave-teardown: install
 	@echo "==> Running muxscript stubslave-teardown regression (#1939)"
 	$(MAKE) -C tests/stubslave test
+
+# #2238: a stubslave that stops answering must cost its features, not the
+# server.  Wedges the channel with SIGSTOP (alive, socket open, never
+# replies) and drives @dbck's COM round-trip through it.
+test-stubwedge: install
+	@echo "==> Running stubslave-wedge regression (#2238)"
+	$(MAKE) -C tests/stubwedge test
 
 # #1863: HIR block-table exhaustion must not OOB-write via add_edge(-1,…).
 test-hir:

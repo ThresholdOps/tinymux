@@ -230,6 +230,13 @@ public:
         // short write or EAGAIN without this remainder would drop module
         // IPC frames (Pass A8 residual).
         std::string writeRemainder;
+        // Milliseconds spent in pump_stubslave making no progress at all
+        // (#2238).  A synchronous COM call parks the WHOLE server in this
+        // pump, so an unbounded wait on a desynced channel is a total,
+        // silent, permanent hang -- one such wedge ran 22 days.  Reset on
+        // any byte read or written; when it passes the limit the channel is
+        // declared dead so the game keeps running without its stubslave.
+        int64_t stallMs{0};
     };
     std::unique_ptr<StubSlaveChannel> stubslave_channel_;
 

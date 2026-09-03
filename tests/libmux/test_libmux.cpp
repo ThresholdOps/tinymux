@@ -117,6 +117,8 @@ typedef int MUX_RESULT;
 extern "C" void Pipe_InitializeQueueInfo(QUEUE_INFO *pqi);
 extern "C" void Pipe_AppendBytes(QUEUE_INFO *pqi, size_t n, const void *p);
 extern "C" void Pipe_EmptyQueue(QUEUE_INFO *pqi);
+extern "C" bool Pipe_GetBytes(QUEUE_INFO *pqi, size_t *pn, void *pch);
+extern "C" size_t Pipe_QueueLength(QUEUE_INFO *pqi);
 extern "C" MUX_RESULT Pipe_SendCallPacketAndWait(uint32_t nChannel, QUEUE_INFO *pqi);
 extern "C" MUX_RESULT Pipe_SendMsgPacket(uint32_t nChannel, QUEUE_INFO *pqi);
 extern "C" MUX_RESULT Pipe_SendDiscPacket(uint32_t nChannel, QUEUE_INFO *pqi);
@@ -1086,6 +1088,54 @@ static void test_pipe_send_without_pump_is_not_ready()
     Pipe_EmptyQueue(&qi);
 }
 
+
+// #2238: Pipe_AppendBytes must advance its SOURCE pointer across blocks.
+//
+// The copy loop fills the tail QUEUE_BLOCK, allocates another, and copies
+// again -- but never advanced `p`, so an append that spans a 32 KB block
+// boundary wrote the first chunk twice and dropped the tail.  nBytes was
+// still incremented correctly, so the queue reported the right LENGTH with
+// the wrong CONTENT: a corrupted module-IPC frame that the peer then
+// mis-frames on.  Reachable in the stubslave channel because a block is
+// consumed in place (Pipe_GetBytes advances pBuffer) and only freed when
+// fully drained, so pBuffer marches toward the end of the block and nFree
+// shrinks to a few bytes under steady small traffic.
+//
+static void test_pipe_append_spans_block_boundary()
+{
+    static QUEUE_INFO qi;
+    Pipe_InitializeQueueInfo(&qi);
+
+    // Fill to a few bytes short of one block, then append across the seam.
+    const size_t nHead = QUEUE_BLOCK_SIZE - 5;
+    static uint8_t head[QUEUE_BLOCK_SIZE];
+    for (size_t i = 0; i < nHead; i++)
+    {
+        head[i] = static_cast<uint8_t>(i & 0xFF);
+    }
+    Pipe_AppendBytes(&qi, nHead, head);
+
+    // 16 bytes with distinct values: 5 land in the current block, 11 in a
+    // freshly allocated one.
+    uint8_t span[16];
+    for (size_t i = 0; i < sizeof(span); i++)
+    {
+        span[i] = static_cast<uint8_t>(0xA0 + i);
+    }
+    Pipe_AppendBytes(&qi, sizeof(span), span);
+
+    ASSERT_EQ(Pipe_QueueLength(&qi), nHead + sizeof(span));
+
+    // Drain and compare the spanning bytes.
+    static uint8_t out[QUEUE_BLOCK_SIZE + 64];
+    size_t nWanted = nHead + sizeof(span);
+    ASSERT_TRUE(Pipe_GetBytes(&qi, &nWanted, out));
+    ASSERT_EQ(nWanted, nHead + sizeof(span));
+    ASSERT_EQ(memcmp(out + nHead, span, sizeof(span)), 0);
+
+    Pipe_EmptyQueue(&qi);
+}
+
 int main()
 {
     printf("libmux Unit Tests\n");
@@ -1177,6 +1227,7 @@ int main()
 
     printf("\n--- module transport before init (#1340) ---\n");
     RUN_TEST(test_pipe_send_without_pump_is_not_ready);
+    RUN_TEST(test_pipe_append_spans_block_boundary);
 
     printf("\n=================\n");
     printf("Results: %d passed, %d failed\n", g_pass, g_fail);
