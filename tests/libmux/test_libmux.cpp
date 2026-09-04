@@ -119,6 +119,10 @@ extern "C" void Pipe_AppendBytes(QUEUE_INFO *pqi, size_t n, const void *p);
 extern "C" void Pipe_EmptyQueue(QUEUE_INFO *pqi);
 extern "C" bool Pipe_GetBytes(QUEUE_INFO *pqi, size_t *pn, void *pch);
 extern "C" size_t Pipe_QueueLength(QUEUE_INFO *pqi);
+
+// collation (utf8_collate.cpp)
+int    mux_collate_cmp(const UTF8 *a, size_t nA, const UTF8 *b, size_t nB);
+size_t mux_collate_sortkey(const UTF8 *src, size_t nSrc, UTF8 *key, size_t nKeyMax);
 extern "C" MUX_RESULT Pipe_SendCallPacketAndWait(uint32_t nChannel, QUEUE_INFO *pqi);
 extern "C" MUX_RESULT Pipe_SendMsgPacket(uint32_t nChannel, QUEUE_INFO *pqi);
 extern "C" MUX_RESULT Pipe_SendDiscPacket(uint32_t nChannel, QUEUE_INFO *pqi);
@@ -1136,6 +1140,62 @@ static void test_pipe_append_spans_block_boundary()
     Pipe_EmptyQueue(&qi);
 }
 
+
+// Canonical equivalence through the NFC tiebreak.
+//
+// The tiebreak exists for exactly one job: make CANONICALLY EQUIVALENT
+// strings compare equal once DUCET weights have tied.  "e"+U+0301 and the
+// precomposed U+00E9 are the textbook pair -- identical weights, different
+// bytes, and NFC is what reconciles them.  Nothing else in the tree tested
+// this; collation had no unit coverage at all.
+//
+// It is also the guard against a port that looks attractive and is not.
+// libutf d19d65e replaced its tiebreak buffers with a small fixed budget
+// (3 * 256 bytes) because ITS buffers were VLAs sized to each operand's own
+// input, so two operands truncated at different points and a comparison
+// could disagree with itself.  TinyMUX never had that bug -- these buffers
+// are fixed and equal-sized -- so adopting the budget here fixes nothing and
+// breaks this: GetNFCBytes' fast path returns already-NFC input untouched at
+// ANY length, while only the slow path would be capped, so a long
+// precomposed string would compare in full against its decomposed twin
+// truncated at the budget, and text that IS the same would order as
+// different.  Measured: with a 768-byte budget the first assertion below
+// fails.  If the budget is ever revisited (the buffers are LBUF_SIZE, which
+// is real stack), bound BOTH paths to the same output length.
+//
+static void test_collate_nfc_tiebreak_equivalence()
+{
+    // 500 x U+00E9 (2 bytes, already NFC) versus 500 x "e"+U+0301 (3 bytes,
+    // NOT NFC).  Canonically equivalent; NFC form is 1000 bytes, comfortably
+    // past a 768-byte budget, so this only ties if both paths are bounded
+    // the same way.
+    std::string pre, dec;
+    for (int i = 0; i < 500; i++)
+    {
+        pre += "\xC3\xA9";           // U+00E9
+        dec += "e\xCC\x81";          // e + U+0301
+    }
+    const UTF8 *pa = reinterpret_cast<const UTF8 *>(pre.data());
+    const UTF8 *pb = reinterpret_cast<const UTF8 *>(dec.data());
+
+    ASSERT_EQ(mux_collate_cmp(pa, pre.size(), pb, dec.size()), 0);
+
+    // Short forms of the same pair must tie too (they always did).
+    const UTF8 *sa = reinterpret_cast<const UTF8 *>("\xC3\xA9");
+    const UTF8 *sb = reinterpret_cast<const UTF8 *>("e\xCC\x81");
+    ASSERT_EQ(mux_collate_cmp(sa, 2, sb, 3), 0);
+
+    // And the comparator must agree with the sort key.
+    static UTF8 keyA[LBUF_SIZE];
+    static UTF8 keyB[LBUF_SIZE];
+    size_t nA = mux_collate_sortkey(pa, pre.size(), keyA, sizeof(keyA));
+    size_t nB = mux_collate_sortkey(pb, dec.size(), keyB, sizeof(keyB));
+    if (nA > sizeof(keyA)) nA = sizeof(keyA);
+    if (nB > sizeof(keyB)) nB = sizeof(keyB);
+    ASSERT_EQ(nA, nB);
+    ASSERT_EQ(memcmp(keyA, keyB, nA), 0);
+}
+
 int main()
 {
     printf("libmux Unit Tests\n");
@@ -1228,6 +1288,9 @@ int main()
     printf("\n--- module transport before init (#1340) ---\n");
     RUN_TEST(test_pipe_send_without_pump_is_not_ready);
     RUN_TEST(test_pipe_append_spans_block_boundary);
+
+    printf("\n--- collation NFC tiebreak (libutf d19d65e) ---\n");
+    RUN_TEST(test_collate_nfc_tiebreak_equivalence);
 
     printf("\n=================\n");
     printf("Results: %d passed, %d failed\n", g_pass, g_fail);
